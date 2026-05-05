@@ -6,7 +6,14 @@ Closes [PerryTS/perry#425](https://github.com/PerryTS/perry/issues/425).
 
 ## What this is
 
-A Perry "native library" package: a Rust crate exporting `extern "C"` symbols that the Perry compiler links into your TypeScript program. From your TypeScript code you import `iroh` like any npm package; under the hood every method call resolves to a direct call into the bundled staticlib.
+A Perry "native library" package: a Rust crate exporting `extern "C"` symbols that the Perry compiler links into your TypeScript program. From your TypeScript code you import `iroh` like any npm package; under the hood every method call resolves to a direct call into the bundled staticlib — no Node addon, no IPC, no JSON marshalling.
+
+This package contains:
+
+- `src/lib.rs` — the Rust crate that wraps `iroh` and exposes `js_iroh_*` `extern "C"` symbols
+- `src/index.d.ts` — the TypeScript surface (`iroh` module declaration) Perry resolves at compile time
+- `Cargo.toml` — staticlib build config consumed by the Perry linker
+- `package.json` — includes the `perry.nativeLibrary` manifest block
 
 ## Install
 
@@ -16,65 +23,243 @@ bun add @perryts/iroh
 npm install @perryts/iroh
 ```
 
-The package's `package.json` declares a `perry.nativeLibrary` block (see the [manifest spec](https://github.com/PerryTS/perry/blob/main/docs/src/native-libraries/manifest-v1.md)) which Perry's compiler reads at link time to discover the staticlib + `extern "C"` symbols.
+The package's `package.json` declares a `perry.nativeLibrary` block (see the [manifest spec](https://github.com/PerryTS/perry/blob/main/docs/src/native-libraries/manifest-v1.md)) which Perry's compiler reads at link time to discover the staticlib + `extern "C"` symbols. No post-install build step — Perry compiles the Rust crate as part of your project's build.
 
-## Usage
+## Quick start
+
+A request/response peer-to-peer round trip. The server binds, prints its node id (share that out-of-band), waits for one peer, reads a message, and echoes it back. The client binds its own endpoint, dials the server's node id, sends a message, and reads the reply.
+
+### Server
 
 ```typescript
 import * as iroh from "iroh";
 
-// Server: bind, share node id, accept one peer, echo bytes.
-{
-  const ep = await iroh.bind();
-  const myId = await iroh.nodeId(ep);
-  console.log("share this with the peer:", myId);
+const ep = await iroh.bind();
+const myId = await iroh.nodeId(ep);
+console.log("share this with the peer:", myId);
 
-  const conn = await iroh.acceptOne(ep);
-  const stream = await iroh.acceptBi(conn);
-  const msg = await iroh.streamReadToEnd(stream, 65_536);
-  await iroh.streamWrite(stream, `echo: ${msg}`);
-  await iroh.streamFinish(stream);
-  await iroh.connClose(conn);
-  await iroh.close(ep);
-}
-
-// Client: bind, connect to peer's node id, send + read echo.
-{
-  const ep = await iroh.bind();
-  const conn = await iroh.connect(ep, "<server-node-id>");
-  const stream = await iroh.openBi(conn);
-  await iroh.streamWrite(stream, "hello, peer!");
-  await iroh.streamFinish(stream);
-  const reply = await iroh.streamReadToEnd(stream, 65_536);
-  console.log(reply);
-  await iroh.connClose(conn);
-  await iroh.close(ep);
-}
+const conn = await iroh.acceptOne(ep);
+const stream = await iroh.acceptBi(conn);
+const msg = await iroh.streamReadToEnd(stream, 65_536);
+await iroh.streamWrite(stream, `echo: ${msg}`);
+await iroh.streamFinish(stream);
+await iroh.connClose(conn);
+await iroh.close(ep);
 ```
 
-## API
+### Client
 
-| Function | Type | Notes |
+```typescript
+import * as iroh from "iroh";
+
+const ep = await iroh.bind();
+const conn = await iroh.connect(ep, "<server-node-id-from-server-stdout>");
+const stream = await iroh.openBi(conn);
+await iroh.streamWrite(stream, "hello, peer!");
+await iroh.streamFinish(stream);
+const reply = await iroh.streamReadToEnd(stream, 65_536);
+console.log(reply);
+await iroh.connClose(conn);
+await iroh.close(ep);
+```
+
+## The handshake flow
+
+Iroh uses three layers of object — endpoint, connection, bi-directional stream — and you call them in roughly mirrored sequences on each side. The server side reads, the client side writes; whichever side calls `streamFinish` first signals "no more bytes from me" so the other side's `streamReadToEnd` resolves.
+
+| Step | Server | Client |
 |---|---|---|
-| `bind()` | `Promise<endpointHandle>` | Bind a fresh QUIC endpoint using Iroh's `N0` relay preset; registers the v0 ALPN |
-| `nodeId(endpoint)` | `Promise<string>` | Hex/base32 EndpointId — share this for peers to connect |
-| `connect(endpoint, nodeId)` | `Promise<connHandle>` | Outgoing connection |
-| `acceptOne(endpoint)` | `Promise<connHandle>` | Wait for the next incoming peer |
-| `openBi(conn)` | `Promise<biStreamHandle>` | Open a bi-directional stream from the local end |
-| `acceptBi(conn)` | `Promise<biStreamHandle>` | Accept the next stream the peer opens |
-| `streamWrite(stream, dataString)` | `Promise<void>` | Write UTF-8 to the send half |
-| `streamFinish(stream)` | `Promise<void>` | Close the send half so the peer's `streamReadToEnd` resolves |
-| `streamReadToEnd(stream, maxBytes)` | `Promise<string>` | Drain the recv half (errors above maxBytes) |
-| `connClose(conn)` | `Promise<void>` | Clean QUIC shutdown |
-| `close(endpoint)` | `Promise<void>` | Close the endpoint |
+| 1 | `bind()` → endpoint | `bind()` → endpoint |
+| 2 | `nodeId(ep)` → publish out-of-band | `connect(ep, nodeId)` → connection |
+| 3 | `acceptOne(ep)` → connection | `openBi(conn)` → stream |
+| 4 | `acceptBi(conn)` → stream | `streamWrite` + `streamFinish` |
+| 5 | `streamReadToEnd` | `streamReadToEnd` |
+| 6 | `streamWrite` + `streamFinish` | `connClose` + `close` |
+| 7 | `connClose` + `close` | — |
+
+`bind` uses Iroh's `N0` preset: discovery via the n0 number-DNS, n0 relay servers for hole-punch fallback. No config knobs in v0.
+
+## API reference
+
+### `bind()`
+
+```typescript
+function bind(): Promise<EndpointHandle>
+```
+
+Bind a fresh QUIC endpoint. Registers the v0 ALPN (`perry-iroh/0`) so this same endpoint can both dial peers and accept incoming connections from clients running this library.
+
+```typescript
+const ep = await iroh.bind();
+```
+
+### `nodeId(endpoint)`
+
+```typescript
+function nodeId(endpoint: EndpointHandle): Promise<string>
+```
+
+Return the local node's stable identifier (a hex-encoded Ed25519 public key). Share this with peers so they can dial you. Awaits the endpoint coming online before reading the address — safe to call right after `bind()`.
+
+```typescript
+const myId = await iroh.nodeId(ep);
+// e.g. "f49a76...c1b4e2"
+```
+
+### `connect(endpoint, nodeId)`
+
+```typescript
+function connect(endpoint: EndpointHandle, nodeId: string): Promise<ConnHandle>
+```
+
+Open an outgoing connection to a peer addressed by its node id (the value of the peer's `nodeId(ep)`). Resolves once the QUIC handshake completes. Uses the hardcoded v0 ALPN, so the peer must also be running `@perryts/iroh`.
+
+```typescript
+const conn = await iroh.connect(ep, serverNodeId);
+```
+
+### `acceptOne(endpoint)`
+
+```typescript
+function acceptOne(endpoint: EndpointHandle): Promise<ConnHandle>
+```
+
+Wait for the next incoming peer connection on this endpoint and finish the handshake. Rejects if the endpoint is closed before a peer arrives. Each call yields one connection — for a server that handles many peers, call it in a loop.
+
+```typescript
+const conn = await iroh.acceptOne(ep);
+```
+
+### `openBi(conn)`
+
+```typescript
+function openBi(conn: ConnHandle): Promise<BiStreamHandle>
+```
+
+Open a bi-directional stream from the local end of the connection. The peer must call `acceptBi` to pick it up.
+
+```typescript
+const stream = await iroh.openBi(conn);
+```
+
+### `acceptBi(conn)`
+
+```typescript
+function acceptBi(conn: ConnHandle): Promise<BiStreamHandle>
+```
+
+Accept the next bi-directional stream the peer opens. Mirrors `openBi`.
+
+```typescript
+const stream = await iroh.acceptBi(conn);
+```
+
+### `streamWrite(stream, data)`
+
+```typescript
+function streamWrite(stream: BiStreamHandle, data: string): Promise<void>
+```
+
+Write a UTF-8 string to the send half of the stream. v0 is text-only — encode binary as base64/hex if needed. Multiple writes are concatenated; the peer sees the bytes once you call `streamFinish` (or in chunks as they arrive over the wire, terminated by `streamFinish`).
+
+```typescript
+await iroh.streamWrite(stream, "hello, peer!");
+```
+
+### `streamFinish(stream)`
+
+```typescript
+function streamFinish(stream: BiStreamHandle): Promise<void>
+```
+
+Close the send half of the stream. The peer's pending `streamReadToEnd` resolves once the in-flight bytes drain. Without this call, the peer's read would hang.
+
+```typescript
+await iroh.streamFinish(stream);
+```
+
+### `streamReadToEnd(stream, maxBytes)`
+
+```typescript
+function streamReadToEnd(stream: BiStreamHandle, maxBytes: number): Promise<string>
+```
+
+Drain the recv half of the stream and resolve with the bytes as a UTF-8 string. Rejects if the peer's payload exceeds `maxBytes` (back-pressure cap to prevent unbounded buffering) or if the bytes aren't valid UTF-8.
+
+```typescript
+const reply = await iroh.streamReadToEnd(stream, 65_536);
+```
+
+### `connClose(conn)`
+
+```typescript
+function connClose(conn: ConnHandle): Promise<void>
+```
+
+Close a peer connection with a clean QUIC shutdown frame and wait for the close to propagate. Idempotent — closing an already-dropped handle resolves successfully.
+
+```typescript
+await iroh.connClose(conn);
+```
+
+### `close(endpoint)`
+
+```typescript
+function close(endpoint: EndpointHandle): Promise<void>
+```
+
+Close the endpoint gracefully. Drops any remaining handle state. Idempotent.
+
+```typescript
+await iroh.close(ep);
+```
+
+## Types
+
+Exported from the `iroh` module declaration in `src/index.d.ts`:
+
+```typescript
+type EndpointHandle = number & { readonly __irohEndpoint: unique symbol };
+type ConnHandle     = number & { readonly __irohConn:     unique symbol };
+type BiStreamHandle = number & { readonly __irohStream:   unique symbol };
+```
+
+These are opaque branded numbers — you should never inspect or arithmetic on them. The brand prevents you from passing an `EndpointHandle` where a `ConnHandle` is expected.
 
 ## ALPN
 
-Hardcoded to `"perry-iroh/0"` for v0 — every server registers it at `bind()` time, every client connects with it. Per-call ALPN strings are a v1 followup.
+Hardcoded to `"perry-iroh/0"` for v0 — every server registers it at `bind()` time, every client connects with it. This means client and server must both be on `@perryts/iroh` (or another implementation that opts into the same ALPN). Per-call ALPN strings are a v1 followup.
 
-## Status
+## Error handling
 
-MVP — connection-event callbacks (e.g. `endpoint.on('connection', cb)`) and broadcast-style fan-out are followups. Tracked in the upstream [`PerryTS/perry`](https://github.com/PerryTS/perry) repo.
+Every async function rejects with an `Error` whose message is prefixed by the operation, e.g. `iroh connect: bad node id: invalid character`. Common rejection reasons:
+
+- Invalid handle (`iroh <op>: invalid <kind> handle`) — you passed a handle that was never returned by this library, or one that was already consumed by `close` / `connClose`.
+- Bad node id (`iroh connect: bad node id: ...`) — the string passed to `connect` is not a parseable Iroh `EndpointId`.
+- Endpoint closed before peer connected (`iroh acceptOne: ...`) — `close` was called while `acceptOne` was pending.
+- Payload too large (`iroh streamReadToEnd: ...`) — the peer wrote more than `maxBytes` before calling `streamFinish`.
+- Non-UTF-8 payload (`iroh streamReadToEnd: payload was not valid UTF-8: ...`) — the peer wrote raw binary; v0 is text-only.
+
+## Status & roadmap
+
+MVP. What's there:
+
+- `bind` / `nodeId` / `close`
+- `connect` / `acceptOne` / `connClose`
+- `openBi` / `acceptBi` / `streamWrite` / `streamFinish` / `streamReadToEnd`
+
+Known gaps, tracked in [`PerryTS/perry`](https://github.com/PerryTS/perry):
+
+- Per-call ALPN strings (v0 hardcodes `perry-iroh/0`)
+- Connection-event callbacks (`endpoint.on('connection', cb)`-style) — closure invocation is already in perry-ffi v0.5.542; we just don't expose an `on()` surface yet
+- Broadcast-style fan-out across connections
+- Binary `Uint8Array` payloads on streams (v0 is UTF-8 strings only)
+- Multiple bi-streams per connection in idiomatic JS (today: open one stream and use it)
+- Unidirectional streams + datagram surface
+
+## Versioning
+
+Pre-1.0. The `perry.nativeLibrary.abiVersion` (currently `0.5`) is a hard pin against Perry's perry-ffi ABI — bump it in lockstep with the Perry release that the bindings target.
 
 ## License
 
