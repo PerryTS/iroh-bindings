@@ -1,6 +1,6 @@
 {
   "name": "@perryts/iroh",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Iroh P2P framework bindings (direct peer-to-peer QUIC + hole punching + relay fallback) for the Perry TypeScript-to-native compiler.",
   "license": "MIT",
   "repository": {
@@ -107,6 +107,36 @@
           "name": "js_iroh_conn_close",
           "params": [
             "i64"
+          ],
+          "returns": "promise"
+        },
+        {
+          "name": "js_iroh_endpoint_connections",
+          "params": [
+            "i64"
+          ],
+          "returns": "f64"
+        },
+        {
+          "name": "js_iroh_conn_node_id",
+          "params": [
+            "i64"
+          ],
+          "returns": "f64"
+        },
+        {
+          "name": "js_iroh_stream_write_buffer",
+          "params": [
+            "i64",
+            "ptr"
+          ],
+          "returns": "promise"
+        },
+        {
+          "name": "js_iroh_stream_read_to_end_buffer",
+          "params": [
+            "i64",
+            "f64"
           ],
           "returns": "promise"
         }

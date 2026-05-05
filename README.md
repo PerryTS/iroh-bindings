@@ -214,6 +214,51 @@ Close the endpoint gracefully. Drops any remaining handle state. Idempotent.
 await iroh.close(ep);
 ```
 
+## v0.2.0 — multi-peer + binary streams
+
+### `endpointConnections(endpoint)` and `connNodeId(conn)`
+
+```typescript
+function endpointConnections(endpoint: EndpointHandle): ConnHandle[];
+function connNodeId(conn: ConnHandle): string;
+```
+
+Synchronous accessors for fan-out / broadcast. `endpointConnections` returns every active peer connection handle that was registered via `connect` or `acceptOne` (and not yet closed via `connClose`). `connNodeId` looks up the remote node id without round-tripping a Promise.
+
+```typescript
+// Server: broadcast a message to every connected client
+const conns = iroh.endpointConnections(ep);
+for (const c of conns) {
+  console.log("sending to", iroh.connNodeId(c));
+  const stream = await iroh.openBi(c);
+  await iroh.streamWrite(stream, "broadcast: hello");
+  await iroh.streamFinish(stream);
+}
+```
+
+### `streamWriteBuffer(stream, buffer)` and `streamReadToEndBuffer(stream, maxBytes)`
+
+```typescript
+function streamWriteBuffer(stream: BiStreamHandle, buffer: Uint8Array | Buffer): Promise<void>;
+function streamReadToEndBuffer(stream: BiStreamHandle, maxBytes: number): Promise<Uint8Array>;
+```
+
+Binary-safe variants of `streamWrite` / `streamReadToEnd`. Use these for file transfer, encrypted payloads, or anything that isn't valid UTF-8.
+
+```typescript
+// Client: send a PNG over QUIC, peer reads it back as a Buffer
+import { readFile } from 'node:fs/promises';
+
+const png = await readFile('hero.png');
+const stream = await iroh.openBi(conn);
+await iroh.streamWriteBuffer(stream, png);
+await iroh.streamFinish(stream);
+
+// Peer side
+const bytes = await iroh.streamReadToEndBuffer(serverStream, 16 * 1024 * 1024);
+console.log("received", bytes.length, "bytes");
+```
+
 ## Types
 
 Exported from the `iroh` module declaration in `src/index.d.ts`:

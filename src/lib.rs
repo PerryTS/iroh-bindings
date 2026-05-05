@@ -35,16 +35,59 @@
 //! is a separate followup.
 
 use perry_ffi::{
-    alloc_string, drop_handle, read_string, register_handle, spawn_blocking, take_handle,
-    with_handle, Handle, JsPromise, JsString, JsValue, Promise, StringHeader,
+    alloc_buffer, alloc_string, drop_handle, js_array_alloc, js_array_push, read_buffer_bytes,
+    read_string, register_handle, spawn_blocking, take_handle, with_handle, BufferHeader, Handle,
+    JsPromise, JsString, JsValue, Promise, StringHeader,
 };
 
 use iroh::{
     endpoint::{presets, Connection, RecvStream, SendStream},
     Endpoint,
 };
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
 use tokio::sync::Mutex as TokioMutex;
+
+// Multi-peer broadcast support (v0.2.0): track which connection
+// handles belong to which endpoint, plus the connection's remote
+// node id. `endpointConnections(ep)` enumerates active peers so
+// user code can do fan-out (`for (const c of conns) await
+// streamWrite(...)`).
+//
+// Removal happens in `connClose` and `acceptOne` / `connect` failure
+// paths. Stale entries are still safe — `with_handle::<IrohConnection>`
+// returns None for dropped handles, so a broadcast loop just skips
+// them.
+struct ConnIndex {
+    by_endpoint: HashMap<Handle, Vec<Handle>>,
+    remote_node_id: HashMap<Handle, String>,
+}
+
+fn conn_index() -> &'static Mutex<ConnIndex> {
+    use std::sync::OnceLock;
+    static IDX: OnceLock<Mutex<ConnIndex>> = OnceLock::new();
+    IDX.get_or_init(|| {
+        Mutex::new(ConnIndex {
+            by_endpoint: HashMap::new(),
+            remote_node_id: HashMap::new(),
+        })
+    })
+}
+
+fn conn_index_register(ep: Handle, conn: Handle, node_id: String) {
+    let mut idx = conn_index().lock().unwrap();
+    idx.by_endpoint.entry(ep).or_default().push(conn);
+    idx.remote_node_id.insert(conn, node_id);
+}
+
+fn conn_index_remove(conn: Handle) {
+    let mut idx = conn_index().lock().unwrap();
+    idx.remote_node_id.remove(&conn);
+    for v in idx.by_endpoint.values_mut() {
+        v.retain(|h| *h != conn);
+    }
+}
 
 /// All client/server pairs use the same hardcoded ALPN for v0; per-
 /// call ALPN bytes are a deferred design decision (see #425 status).
@@ -195,7 +238,9 @@ pub unsafe extern "C" fn js_iroh_connect(
         });
         match outcome {
             Some(Ok(conn)) => {
+                let remote_id = conn.remote_id().to_string();
                 let handle = register_handle(IrohConnection { conn });
+                conn_index_register(ep_handle, handle, remote_id);
                 promise.resolve(JsValue::from_number(handle as f64));
             }
             Some(Err(e)) => promise.reject_string(&format!("iroh connect: {}", e)),
@@ -227,7 +272,9 @@ pub extern "C" fn js_iroh_accept_one(ep_handle: Handle) -> *mut Promise {
         });
         match outcome {
             Some(Ok(conn)) => {
+                let remote_id = conn.remote_id().to_string();
                 let handle = register_handle(IrohConnection { conn });
+                conn_index_register(ep_handle, handle, remote_id);
                 promise.resolve(JsValue::from_number(handle as f64));
             }
             Some(Err(e)) => promise.reject_string(&format!("iroh acceptOne: {}", e)),
@@ -407,6 +454,7 @@ pub extern "C" fn js_iroh_stream_read_to_end(
 pub extern "C" fn js_iroh_conn_close(conn_handle: Handle) -> *mut Promise {
     let promise = JsPromise::new();
     let raw = promise.as_raw();
+    conn_index_remove(conn_handle);
 
     spawn_blocking(move || {
         let conn = take_handle::<IrohConnection>(conn_handle);
@@ -427,8 +475,165 @@ pub extern "C" fn js_iroh_conn_close(conn_handle: Handle) -> *mut Promise {
     raw
 }
 
+// ── v0.2.0 — multi-peer + binary-payload surface ──────────────────────
+
+/// `iroh.endpointConnections(endpointHandle) -> number[]` —
+/// synchronous accessor returning the list of currently-active peer
+/// connection handles for `endpointHandle`. Each entry is a handle
+/// previously returned from `connect` or `acceptOne`. Use this for
+/// broadcast (`for (const c of conns) await streamWrite(...)`).
+///
+/// Returns an empty array if the endpoint has no peers or has been
+/// closed. Stale entries are not possible since closing a connection
+/// (`connClose`) deregisters it; if a peer drops without an explicit
+/// close, the next `with_handle` lookup will fail safely.
+#[no_mangle]
+pub extern "C" fn js_iroh_endpoint_connections(ep_handle: Handle) -> JsValue {
+    let conns = {
+        let idx = conn_index().lock().unwrap();
+        idx.by_endpoint
+            .get(&ep_handle)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut arr = unsafe { js_array_alloc(conns.len() as u32) };
+    for h in conns {
+        arr = unsafe { js_array_push(arr, JsValue::from_number(h as f64)) };
+    }
+    JsValue::from_object_ptr(arr)
+}
+
+/// `iroh.connNodeId(connHandle) -> string` — synchronous accessor
+/// returning the remote peer's hex-encoded node id for an active
+/// connection. Returns the empty string if `connHandle` is unknown
+/// (already closed or never registered).
+#[no_mangle]
+pub extern "C" fn js_iroh_conn_node_id(conn_handle: Handle) -> JsValue {
+    let id = {
+        let idx = conn_index().lock().unwrap();
+        idx.remote_node_id
+            .get(&conn_handle)
+            .cloned()
+            .unwrap_or_default()
+    };
+    JsValue::from_string_ptr(alloc_string(&id).as_raw())
+}
+
+/// `iroh.streamWriteBuffer(streamHandle, buffer) -> Promise<undefined>`
+/// — binary-safe variant of `streamWrite`. The `buffer` argument is a
+/// Perry-runtime `Buffer` (or `Uint8Array`); the bytes are sent
+/// verbatim with no UTF-8 round-trip.
+///
+/// # Safety
+///
+/// `buf_ptr` must be null or a valid `BufferHeader` pointer (the
+/// runtime supplies these via NA_PTR coercion at the call site).
+#[no_mangle]
+pub unsafe extern "C" fn js_iroh_stream_write_buffer(
+    stream_handle: Handle,
+    buf_ptr: *const BufferHeader,
+) -> *mut Promise {
+    let promise = JsPromise::new();
+    let raw = promise.as_raw();
+    let bytes = match read_buffer_bytes(buf_ptr) {
+        Some(b) => b.to_vec(),
+        None => {
+            promise.reject_string("iroh streamWriteBuffer: invalid buffer");
+            return raw;
+        }
+    };
+
+    spawn_blocking(move || {
+        let outcome = with_handle::<IrohBiStream, _, _>(stream_handle, |h| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut send = h.send.lock().await;
+                send.write_all(&bytes)
+                    .await
+                    .map_err(|e| format!("streamWriteBuffer: {}", e))
+            })
+        });
+        match outcome {
+            Some(Ok(())) => promise.resolve_undefined(),
+            Some(Err(e)) => promise.reject_string(&format!("iroh streamWriteBuffer: {}", e)),
+            None => promise.reject_string("iroh streamWriteBuffer: invalid stream handle"),
+        }
+    });
+    raw
+}
+
+/// `iroh.streamReadToEndBuffer(streamHandle, maxBytes) -> Promise<Buffer>`
+/// — binary-safe variant of `streamReadToEnd`. Returns the bytes as a
+/// Perry-runtime `Buffer` instead of a UTF-8 string, so binary file
+/// transfer / protocol payloads / encrypted data round-trip cleanly.
+#[no_mangle]
+pub extern "C" fn js_iroh_stream_read_to_end_buffer(
+    stream_handle: Handle,
+    max_bytes: f64,
+) -> *mut Promise {
+    let promise = JsPromise::new();
+    let raw = promise.as_raw();
+    let cap = max_bytes.max(0.0) as usize;
+
+    spawn_blocking(move || {
+        let outcome = with_handle::<IrohBiStream, _, _>(stream_handle, |h| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut recv = h.recv.lock().await;
+                recv.read_to_end(cap)
+                    .await
+                    .map_err(|e| format!("streamReadToEndBuffer: {}", e))
+            })
+        });
+        match outcome {
+            Some(Ok(bytes)) => {
+                let buf = alloc_buffer(&bytes);
+                promise.resolve(JsValue::from_object_ptr(buf as *mut perry_ffi::ObjectHeader));
+            }
+            Some(Err(e)) => promise.reject_string(&format!("iroh streamReadToEndBuffer: {}", e)),
+            None => promise.reject_string("iroh streamReadToEndBuffer: invalid stream handle"),
+        }
+    });
+    raw
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_index_register_then_remove() {
+        // Use very high handle ids to avoid collision with anything
+        // perry-ffi might have registered in the same process under
+        // its own scheme.
+        let ep: Handle = 91_000_001;
+        let conn: Handle = 92_000_001;
+        conn_index_register(ep, conn, "test-node-id".to_string());
+        {
+            let idx = conn_index().lock().unwrap();
+            assert_eq!(idx.by_endpoint.get(&ep).map(|v| v.len()), Some(1));
+            assert_eq!(idx.remote_node_id.get(&conn).map(|s| s.as_str()), Some("test-node-id"));
+        }
+        conn_index_remove(conn);
+        let idx = conn_index().lock().unwrap();
+        assert!(idx.remote_node_id.get(&conn).is_none());
+        assert!(idx.by_endpoint.get(&ep).map(|v| v.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn conn_index_multiple_peers_per_endpoint() {
+        let ep: Handle = 91_000_002;
+        conn_index_register(ep, 92_000_010, "peer-a".to_string());
+        conn_index_register(ep, 92_000_011, "peer-b".to_string());
+        conn_index_register(ep, 92_000_012, "peer-c".to_string());
+        let idx = conn_index().lock().unwrap();
+        assert_eq!(idx.by_endpoint.get(&ep).map(|v| v.len()), Some(3));
+    }
+
+    #[test]
+    fn conn_index_remove_unknown_is_noop() {
+        // Removing a handle never registered must not panic.
+        conn_index_remove(99_999_999);
+    }
+
     // End-to-end iroh tests need a live tokio runtime + network
     // access (n0 relay + hole-punching infrastructure). Out of
     // scope for unit testing — the wrapper just plumbs through
