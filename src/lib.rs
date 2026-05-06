@@ -17,11 +17,19 @@
 //!   streamReadToEnd() + streamWrite() + streamFinish()`, client
 //!   `bind() -> connect(serverNodeId) -> openBi() -> streamWrite() +
 //!   streamFinish() + streamReadToEnd()`.
+//! - v0.2.0: endpointConnections / connNodeId for fan-out, plus
+//!   binary-safe streamWriteBuffer / streamReadToEndBuffer.
+//! - v0.3.0: bind now accepts an options object (`secretKey` for
+//!   stable identity across restarts, `mdns` for LAN peer discovery).
+//!   Adds `generateSecretKey` / `secretKeyFromSeed` for deterministic
+//!   identities, and `nodeStatus` for a one-shot reachability
+//!   snapshot.
 //!
 //! Followups: per-call ALPN strings (we hardcode the v0 ALPN for
 //! now), connection-event callbacks (closure invocation already
-//! shipped in v0.5.542 — we just don't expose an `on()` surface
-//! yet), broadcast-style fan-out across connections.
+//! shipped in perry-ffi but we don't expose an `on()` surface yet),
+//! and a streaming-subscriptions API for both connection events
+//! and `nodeStatus` changes (today it's a one-shot snapshot).
 //!
 //! # Why MVP scope
 //!
@@ -35,14 +43,16 @@
 //! is a separate followup.
 
 use perry_ffi::{
-    alloc_buffer, alloc_string, drop_handle, js_array_alloc, js_array_push, read_buffer_bytes,
+    alloc_buffer, alloc_string, build_object_shape, drop_handle, js_array_alloc, js_array_push,
+    js_object_alloc_with_shape, js_object_get_field, js_object_set_field, read_buffer_bytes,
     read_string, register_handle, spawn_blocking, take_handle, with_handle, BufferHeader, Handle,
-    JsPromise, JsString, JsValue, Promise, StringHeader,
+    JsPromise, JsString, JsValue, ObjectHeader, Promise, StringHeader,
 };
 
 use iroh::{
+    address_lookup::MdnsAddressLookupBuilder,
     endpoint::{presets, Connection, RecvStream, SendStream},
-    Endpoint,
+    Endpoint, SecretKey, Watcher,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -119,23 +129,80 @@ unsafe fn read_str(ptr: *const StringHeader) -> Option<String> {
     read_string(handle).map(String::from)
 }
 
-/// `iroh.bind() -> Promise<Handle>` — bind a fresh QUIC endpoint
-/// using Iroh's `N0` relay preset (sane defaults: discovery via
-/// the n0 number-DNS, n0 relay servers for hole-punch fallback).
-/// Registers the v0 ALPN (`perry-iroh/0`) so the same endpoint can
-/// also accept incoming connections from clients calling
-/// `js_iroh_connect`. Resolves with an opaque integer handle.
+/// Parsed `BindOptions` extracted from a JS object. Shape and key
+/// order is documented in `index.d.ts` (`BindOptions`); we read by
+/// type-dispatch over the first few fields rather than fixed index
+/// so users can declare keys in either order.
+#[derive(Default)]
+struct BindOptions {
+    secret_key: Option<SecretKey>,
+    mdns: bool,
+}
+
+/// Read fields off a JS object by type. With only two declared fields
+/// of disjoint types (string + bool), we don't depend on key order.
+unsafe fn parse_bind_options(opts: JsValue) -> BindOptions {
+    let mut result = BindOptions::default();
+    let obj_ptr = opts.as_pointer::<ObjectHeader>();
+    if obj_ptr.is_null() {
+        return result;
+    }
+    // Probe a small fixed number of slots — `js_object_get_field`
+    // returns UNDEFINED for out-of-range indices, so this is safe even
+    // for `{}`, `{secretKey}`, or `{mdns}` objects.
+    for i in 0..4 {
+        let v = js_object_get_field(obj_ptr, i);
+        if v.is_string() {
+            let sk_ptr = v.as_string_ptr();
+            if let Some(s) = read_string(JsString::from_raw(sk_ptr)) {
+                if let Ok(sk) = SecretKey::from_str(s.trim()) {
+                    result.secret_key = Some(sk);
+                }
+            }
+        } else if v.is_bool() {
+            result.mdns = v.to_bool();
+        }
+    }
+    result
+}
+
+/// `iroh.bind(options?) -> Promise<Handle>` — bind a fresh QUIC
+/// endpoint using Iroh's `N0` relay preset (discovery via the n0
+/// number-DNS, n0 relay servers for hole-punch fallback). Registers
+/// the v0 ALPN (`perry-iroh/0`) so the same endpoint can also accept
+/// incoming connections from clients calling `js_iroh_connect`.
+/// Resolves with an opaque integer handle.
+///
+/// `options` (all optional):
+/// - `secretKey` — base32-or-hex-encoded `SecretKey` for stable node
+///   identity across restarts. Omit to generate a fresh random key.
+/// - `mdns` — when `true`, attaches an `MdnsAddressLookup` so peers
+///   on the same LAN can be discovered without round-tripping through
+///   the n0 relay.
+///
+/// # Safety
+///
+/// `opts_f` must be the NaN-boxed bits of a `JsValue` — either an
+/// object, `undefined`, or `null`. Perry codegen guarantees this for
+/// any TS call site that types the argument as `BindOptions | undefined`.
 #[no_mangle]
-pub extern "C" fn js_iroh_bind() -> *mut Promise {
+pub unsafe extern "C" fn js_iroh_bind(opts_f: f64) -> *mut Promise {
+    let opts = JsValue::from_bits(opts_f.to_bits());
+    let parsed = parse_bind_options(opts);
     let promise = JsPromise::new();
     let raw = promise.as_raw();
 
     spawn_blocking(move || {
         let result = tokio::runtime::Handle::current().block_on(async move {
-            Endpoint::builder(presets::N0)
-                .alpns(vec![PERRY_IROH_ALPN.to_vec()])
-                .bind()
-                .await
+            let mut builder =
+                Endpoint::builder(presets::N0).alpns(vec![PERRY_IROH_ALPN.to_vec()]);
+            if let Some(sk) = parsed.secret_key {
+                builder = builder.secret_key(sk);
+            }
+            if parsed.mdns {
+                builder = builder.address_lookup(MdnsAddressLookupBuilder::default());
+            }
+            builder.bind().await
         });
         match result {
             Ok(endpoint) => {
@@ -143,6 +210,121 @@ pub extern "C" fn js_iroh_bind() -> *mut Promise {
                 promise.resolve(JsValue::from_number(handle as f64));
             }
             Err(e) => promise.reject_string(&format!("iroh bind: {}", e)),
+        }
+    });
+    raw
+}
+
+/// `iroh.generateSecretKey() -> string` — synchronous helper that
+/// returns a freshly-generated `SecretKey` as a 64-char hex string.
+/// Persist this somewhere durable to keep a stable node identity
+/// across restarts (pass it back to `bind({secretKey})` next time).
+#[no_mangle]
+pub extern "C" fn js_iroh_generate_secret_key() -> JsValue {
+    let bytes = SecretKey::generate().to_bytes();
+    JsValue::from_string_ptr(alloc_string(&hex_encode_32(&bytes)).as_raw())
+}
+
+/// `iroh.secretKeyFromSeed(seed) -> string` — synchronous. Build a
+/// deterministic `SecretKey` from exactly 32 bytes of seed material
+/// (e.g. SHA-256 of a passphrase). Returns the hex-encoded key, or
+/// the empty string if `seed` is missing or not 32 bytes.
+///
+/// # Safety
+///
+/// `seed_ptr` must be null or a Perry-runtime `BufferHeader`.
+#[no_mangle]
+pub unsafe extern "C" fn js_iroh_secret_key_from_seed(seed_ptr: *const BufferHeader) -> JsValue {
+    let bytes = match read_buffer_bytes(seed_ptr) {
+        Some(b) if b.len() == 32 => b,
+        _ => return JsValue::from_string_ptr(alloc_string("").as_raw()),
+    };
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes);
+    let sk = SecretKey::from_bytes(&arr);
+    JsValue::from_string_ptr(alloc_string(&hex_encode_32(&sk.to_bytes())).as_raw())
+}
+
+fn hex_encode_32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// `iroh.nodeStatus(endpointHandle) -> Promise<NodeStatus>` —
+/// snapshot of the endpoint's current network reachability. Resolves
+/// with `{ nodeId, online, homeRelay, directAddrs }`:
+///
+/// - `nodeId` — the endpoint's stable identifier
+/// - `online` — `true` once at least one relay handshake has
+///   completed OR a direct UDP path has been observed
+/// - `homeRelay` — relay URL the endpoint is using as its home, or
+///   the empty string if none is selected yet
+/// - `directAddrs` — observed direct IP+port socket addresses
+///
+/// Designed as a one-shot snapshot. Subscribing to status *changes*
+/// would require a callback / event surface; that's a deferred
+/// followup tracked alongside the connection-event work in `lib.rs`.
+#[no_mangle]
+pub extern "C" fn js_iroh_node_status(ep_handle: Handle) -> *mut Promise {
+    let promise = JsPromise::new();
+    let raw = promise.as_raw();
+
+    spawn_blocking(move || {
+        let outcome = with_handle::<IrohEndpoint, _, _>(ep_handle, |h| {
+            let mut watcher = h.endpoint.watch_addr();
+            let addr = watcher.get();
+            let mut home_relay = String::new();
+            let mut direct_addrs: Vec<String> = Vec::new();
+            for ta in &addr.addrs {
+                match ta {
+                    iroh::TransportAddr::Relay(url) => {
+                        if home_relay.is_empty() {
+                            home_relay = url.to_string();
+                        }
+                    }
+                    iroh::TransportAddr::Ip(sock) => direct_addrs.push(sock.to_string()),
+                    _ => {}
+                }
+            }
+            let online = !addr.addrs.is_empty();
+            (addr.id.to_string(), online, home_relay, direct_addrs)
+        });
+
+        match outcome {
+            Some((node_id, online, home_relay, direct_addrs)) => unsafe {
+                let keys = ["nodeId", "online", "homeRelay", "directAddrs"];
+                let (packed, shape_id) = build_object_shape(&keys);
+                let obj = js_object_alloc_with_shape(
+                    shape_id,
+                    keys.len() as u32,
+                    packed.as_ptr(),
+                    packed.len() as u32,
+                );
+                js_object_set_field(
+                    obj,
+                    0,
+                    JsValue::from_string_ptr(alloc_string(&node_id).as_raw()),
+                );
+                js_object_set_field(obj, 1, JsValue::from_bool(online));
+                js_object_set_field(
+                    obj,
+                    2,
+                    JsValue::from_string_ptr(alloc_string(&home_relay).as_raw()),
+                );
+                let mut arr = js_array_alloc(direct_addrs.len() as u32);
+                for s in &direct_addrs {
+                    let sv = JsValue::from_string_ptr(alloc_string(s).as_raw());
+                    arr = js_array_push(arr, sv);
+                }
+                js_object_set_field(obj, 3, JsValue::from_object_ptr(arr));
+                promise.resolve(JsValue::from_object_ptr(obj));
+            },
+            None => promise.reject_string("iroh nodeStatus: invalid endpoint handle"),
         }
     });
     raw
@@ -632,6 +814,34 @@ mod tests {
     fn conn_index_remove_unknown_is_noop() {
         // Removing a handle never registered must not panic.
         conn_index_remove(99_999_999);
+    }
+
+    #[test]
+    fn hex_encode_32_lowercase_64_chars() {
+        let zero = [0u8; 32];
+        assert_eq!(
+            hex_encode_32(&zero),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let mut mixed = [0u8; 32];
+        mixed[0] = 0x0a;
+        mixed[1] = 0xb1;
+        mixed[31] = 0xff;
+        let s = hex_encode_32(&mixed);
+        assert_eq!(s.len(), 64);
+        assert!(s.starts_with("0ab1"));
+        assert!(s.ends_with("ff"));
+    }
+
+    #[test]
+    fn deterministic_secret_key_same_seed_same_id() {
+        // Two SecretKey::from_bytes calls with the same seed must
+        // produce the same public key — that's the whole point of
+        // the seed-based API the issue commenter asked for.
+        let seed = [42u8; 32];
+        let a = SecretKey::from_bytes(&seed);
+        let b = SecretKey::from_bytes(&seed);
+        assert_eq!(a.public(), b.public());
     }
 
     // End-to-end iroh tests need a live tokio runtime + network

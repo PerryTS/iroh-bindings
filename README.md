@@ -77,20 +77,34 @@ Iroh uses three layers of object — endpoint, connection, bi-directional stream
 | 6 | `streamWrite` + `streamFinish` | `connClose` + `close` |
 | 7 | `connClose` + `close` | — |
 
-`bind` uses Iroh's `N0` preset: discovery via the n0 number-DNS, n0 relay servers for hole-punch fallback. No config knobs in v0.
+`bind` uses Iroh's `N0` preset: discovery via the n0 number-DNS, n0 relay servers for hole-punch fallback. v0.3 adds optional `secretKey` (stable identity across restarts) and `mdns` (LAN peer discovery) knobs — see [`bind(options?)`](#bindoptions) below.
 
 ## API reference
 
-### `bind()`
+### `bind(options?)`
 
 ```typescript
-function bind(): Promise<EndpointHandle>
+interface BindOptions {
+  secretKey?: string;  // hex- or base32-encoded SecretKey for stable identity
+  mdns?: boolean;      // enable LAN peer discovery via mDNS-like swarm discovery
+}
+
+function bind(options?: BindOptions): Promise<EndpointHandle>
 ```
 
 Bind a fresh QUIC endpoint. Registers the v0 ALPN (`perry-iroh/0`) so this same endpoint can both dial peers and accept incoming connections from clients running this library.
 
 ```typescript
+// No options — fresh random identity, n0 relay/DNS only.
 const ep = await iroh.bind();
+
+// Stable identity across restarts.
+const sk = process.env.IROH_SECRET ?? iroh.generateSecretKey();
+// (persist `sk` somewhere, e.g. write it to .env)
+const ep2 = await iroh.bind({ secretKey: sk });
+
+// LAN discovery on top of the relay.
+const ep3 = await iroh.bind({ secretKey: sk, mdns: true });
 ```
 
 ### `nodeId(endpoint)`
@@ -214,6 +228,52 @@ Close the endpoint gracefully. Drops any remaining handle state. Idempotent.
 await iroh.close(ep);
 ```
 
+## v0.3.0 — bind options, deterministic keys, status snapshots
+
+### `generateSecretKey()` and `secretKeyFromSeed(seed)`
+
+```typescript
+function generateSecretKey(): string;
+function secretKeyFromSeed(seed: Uint8Array | Buffer): string;
+```
+
+Synchronous helpers for producing the `secretKey` you pass into `bind`. `generateSecretKey` returns a fresh random key as a 64-char hex string; `secretKeyFromSeed` takes exactly 32 bytes (e.g. a SHA-256 of a passphrase) and returns the deterministic key derived from those bytes — same seed in, same key out, same `nodeId` out. Returns `""` on a malformed (wrong-length) seed.
+
+```typescript
+import { createHash } from "node:crypto";
+
+// Same passphrase → same nodeId every run, no env file needed.
+const seed = createHash("sha256").update("my-app:dev-fixture").digest();
+const sk = iroh.secretKeyFromSeed(seed);
+const ep = await iroh.bind({ secretKey: sk });
+```
+
+### `nodeStatus(endpoint)`
+
+```typescript
+interface NodeStatus {
+  nodeId: string;
+  online: boolean;
+  homeRelay: string;       // empty string if none yet
+  directAddrs: string[];   // observed "ip:port" entries
+}
+
+function nodeStatus(endpoint: EndpointHandle): Promise<NodeStatus>;
+```
+
+One-shot snapshot of the endpoint's current network reachability — useful for healthchecks and human-readable status pages. Subscribing to *changes* would need a callback/event surface; that's a deferred followup tracked alongside the connection-event work in `lib.rs`.
+
+```typescript
+const status = await iroh.nodeStatus(ep);
+console.log(status);
+// {
+//   nodeId: "f49a76...c1b4e2",
+//   online: true,
+//   homeRelay: "https://use1-1.relay.iroh.network./",
+//   directAddrs: ["192.168.1.42:51820", "[2601:...]:51820"]
+// }
+```
+
 ## v0.2.0 — multi-peer + binary streams
 
 ### `endpointConnections(endpoint)` and `connNodeId(conn)`
@@ -287,18 +347,20 @@ Every async function rejects with an `Error` whose message is prefixed by the op
 
 ## Status & roadmap
 
-MVP. What's there:
+What's there:
 
-- `bind` / `nodeId` / `close`
+- `bind(options?)` / `nodeId` / `close` / `nodeStatus` (snapshot)
+- `generateSecretKey` / `secretKeyFromSeed` for stable identities
 - `connect` / `acceptOne` / `connClose`
+- `endpointConnections` / `connNodeId` for fan-out
 - `openBi` / `acceptBi` / `streamWrite` / `streamFinish` / `streamReadToEnd`
+- `streamWriteBuffer` / `streamReadToEndBuffer` (binary)
+- `bind({ mdns: true })` for LAN peer discovery
 
 Known gaps, tracked in [`PerryTS/perry`](https://github.com/PerryTS/perry):
 
-- Per-call ALPN strings (v0 hardcodes `perry-iroh/0`)
-- Connection-event callbacks (`endpoint.on('connection', cb)`-style) — closure invocation is already in perry-ffi v0.5.542; we just don't expose an `on()` surface yet
-- Broadcast-style fan-out across connections
-- Binary `Uint8Array` payloads on streams (v0 is UTF-8 strings only)
+- Per-call ALPN strings (still hardcodes `perry-iroh/0`)
+- Streaming subscriptions to node-status / discovery events — `nodeStatus` returns a one-shot snapshot today; subscribing to changes needs a callback/event surface that's a separate followup (also blocks `endpoint.on('connection', cb)`-style)
 - Multiple bi-streams per connection in idiomatic JS (today: open one stream and use it)
 - Unidirectional streams + datagram surface
 
